@@ -1,0 +1,3 @@
+[submodule "deps/libss2022-client"]
+	path = deps/libss2022-client
+	url = https://github.com/wyzhou-com/libss2022-client.git
