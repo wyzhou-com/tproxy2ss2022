@@ -46,6 +46,9 @@ typedef struct tcp_session_t {
     evtimer_t phase_timer;
     uint8_t   server_idx;
     bool      relay_in_allocated;
+    uint8_t   tried_servers_mask;
+    uint8_t   retry_count;
+    uint64_t  selector_attempt_epoch;
     skaddr6_t client_peer_addr;
 
     union {

@@ -73,6 +73,7 @@ tcp_connect_result_t tcp_connect(int sockfd, const void *addr, const void *tfo_d
 
 /* on connect error, errno is set appropriately */
 bool tcp_has_error(int sockfd);
+bool socket_error_is_local(int err);
 
 /* set so_linger(delay=0) and call close(sockfd) */
 void tcp_close_by_rst(int sockfd);

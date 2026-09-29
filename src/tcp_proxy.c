@@ -31,6 +31,8 @@ static inline tcp_session_t *tcp_session_from_watcher(evio_t *watcher) {
     return (tcp_session_t *)watcher->data;
 }
 
+static bool tcp_handshake_retry(evloop_t *evloop, tcp_session_t *session, const char *reason, bool node_failure);
+
 static inline void tcp_session_close(evloop_t *evloop, tcp_session_t *session, bool is_tcp_reset) {
     evio_t *client_watcher = &session->client_watcher;
     evio_t *server_watcher = &session->server_watcher;
@@ -76,8 +78,10 @@ static inline void tcp_session_close(evloop_t *evloop, tcp_session_t *session, b
 
 static void tcp_handshake_on_timeout(evloop_t *evloop, struct ev_watcher *watcher, int revents __attribute__((unused))) {
     tcp_session_t *session = (tcp_session_t *)watcher->data;
-    LOGERR("[tcp_handshake] connect/header-send timed out (%gs), closing", TCP_CONNECT_TIMEOUT_SEC);
-    tcp_session_close(evloop, session, true);
+    LOGERR("[tcp_handshake] connect/header-send to [%d] %s#%hu timed out (%gs)",
+           session->server_idx, g_ss_servers[session->server_idx].ipstr,
+           g_ss_servers[session->server_idx].portno, TCP_CONNECT_TIMEOUT_SEC);
+    (void)tcp_handshake_retry(evloop, session, "connect/header-send timeout", true);
 }
 
 static bool tcp_proxy_resolve_target(int client_sockfd, bool isipv4, ss2022_addr *target) {
@@ -139,7 +143,8 @@ static bool tcp_proxy_resolve_target(int client_sockfd, bool isipv4, ss2022_addr
 
 static int tcp_handshake_connect_server(const ss_server_t *srv, const uint8_t *request_header,
                                         size_t request_header_len, ssize_t *tfo_nsend,
-                                        tcp_connect_result_t *conn) {
+                                        tcp_connect_result_t *conn, bool *node_failure) {
+    *node_failure = false;
     int server_sockfd = new_tcp_connect_sockfd(srv->skaddr.sin6_family, g_tcp_syncnt_max);
     if (server_sockfd < 0) {
         LOGERR("[tcp_handshake] new_tcp_connect_sockfd: %s", strerror(errno));
@@ -156,6 +161,7 @@ static int tcp_handshake_connect_server(const ss_server_t *srv, const uint8_t *r
     *tfo_nsend = -1;
     *conn = tcp_connect(server_sockfd, &srv->skaddr, tfo_data, tfo_datalen, tfo_nsend);
     if (*conn == TCP_CONNECT_FAILED) {
+        *node_failure = !socket_error_is_local(errno);
         LOGERR("[tcp_handshake] connect to %s#%hu: %s", srv->ipstr, srv->portno, strerror(errno));
         close(server_sockfd);
         return -1;
@@ -236,6 +242,7 @@ static bool tcp_relay_process_server_data(evloop_t *evloop, tcp_session_t *sessi
                             session->relay.response_header_len);
             base = session->relay.server_to_client_in + session->relay.server_to_client_in_head;
             session->relay.response_header_done = true;
+            server_selector_report_tcp_success(session->server_idx, session->selector_attempt_epoch);
             session->relay.server_to_client_need_len = false;
         }
 
@@ -641,15 +648,16 @@ static int tcp_handshake_send_request_header(evloop_t *evloop, tcp_session_t *se
             return 0;
         }
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            bool node_failure = !socket_error_is_local(errno);
             LOGERR("[tcp_handshake] send to %s#%hu: %s", srv->ipstr, srv->portno, strerror(errno));
-            tcp_session_close(evloop, session, true);
+            (void)tcp_handshake_retry(evloop, session, "send request header failed", node_failure);
             return -1;
         }
         return 0;
     }
     if (nsend == 0) {
         LOGERR("[tcp_handshake] send returned 0");
-        tcp_session_close(evloop, session, true);
+        (void)tcp_handshake_retry(evloop, session, "send request header returned 0", true);
         return -1;
     }
     size_t new_offset = (size_t)*request_header_sent + (size_t)nsend;
@@ -676,8 +684,9 @@ static void tcp_handshake_on_server_connected(evloop_t *evloop, struct ev_watche
     tcp_session_t *session = tcp_session_from_watcher(server_watcher);
     ss_server_t *srv = &g_ss_servers[session->server_idx];
     if (tcp_has_error(server_watcher->fd)) {
+        bool node_failure = !socket_error_is_local(errno);
         LOGERR("[tcp_handshake] connect to %s#%hu: %s", srv->ipstr, srv->portno, strerror(errno));
-        tcp_session_close(evloop, session, true);
+        (void)tcp_handshake_retry(evloop, session, "connect error", node_failure);
         return;
     }
     LOGINF("[tcp_handshake] connected to %s#%hu", srv->ipstr, srv->portno);
@@ -725,12 +734,10 @@ static bool tcp_handshake_build_request_header(tcp_session_t *session) {
     return true;
 }
 
-static bool tcp_handshake_start(evloop_t *evloop, tcp_session_t *session) {
-    ev_timer_stop(evloop, &session->phase_timer);
-    ev_io_stop(evloop, &session->client_watcher);
-
+static bool tcp_handshake_try_connect(evloop_t *evloop, tcp_session_t *session, bool *node_failure) {
+    *node_failure = false;
+    session->selector_attempt_epoch = server_selector_tcp_attempt(session->server_idx);
     if (!tcp_handshake_build_request_header(session)) {
-        tcp_session_close(evloop, session, true);
         return false;
     }
 
@@ -739,9 +746,8 @@ static bool tcp_handshake_start(evloop_t *evloop, tcp_session_t *session) {
     ss_server_t *srv = &g_ss_servers[session->server_idx];
     int server_sockfd = tcp_handshake_connect_server(srv, session->handshake.request_header,
                         session->handshake.request_header_len,
-                        &tfo_nsend, &conn);
+                        &tfo_nsend, &conn, node_failure);
     if (server_sockfd < 0) {
-        tcp_session_close(evloop, session, true);
         return false;
     }
 
@@ -754,6 +760,79 @@ static bool tcp_handshake_start(evloop_t *evloop, tcp_session_t *session) {
         tcp_handshake_on_server_connected(evloop, (struct ev_watcher *)&session->server_watcher, EV_WRITE);
     }
     return true;
+}
+
+static bool tcp_handshake_retry(evloop_t *evloop, tcp_session_t *session, const char *reason,
+                                bool node_failure) {
+    while (true) {
+        int failed_idx = session->server_idx;
+        if (node_failure) server_selector_report_tcp_failure(failed_idx);
+        node_failure = false;
+
+        /* Initial payload is authenticated with the variable-length header.
+         * Once the entire header (including its tag) is queued, the server
+         * may have forwarded the payload even if the TFO connect times out. */
+        if (session->handshake.initial_payload_len > 0 &&
+                session->handshake.request_header_len > 0 &&
+                session->handshake.request_header_sent >= session->handshake.request_header_len) {
+            LOGERR("[tcp_handshake] request with initial payload fully queued to server [%d]; "
+                   "not retrying after %s to avoid replay", failed_idx, reason);
+            tcp_session_close(evloop, session, true);
+            return false;
+        }
+
+        ev_timer_stop(evloop, &session->phase_timer);
+        if (session->server_watcher.fd >= 0) {
+            ev_io_stop(evloop, &session->server_watcher);
+            close(session->server_watcher.fd);
+            session->server_watcher.fd = -1;
+        }
+        ss2022_tcp_client_free(&session->ss_client);
+        memset(&session->ss_client, 0, sizeof(session->ss_client));
+
+        if (tcp_has_error(session->client_watcher.fd)) {
+            IF_VERBOSE LOGINF_RAW("[tcp_handshake] client closed connection during handshake, aborting");
+            tcp_session_close(evloop, session, false);
+            return false;
+        }
+
+        int next_idx = server_selector_next_best_tcp(session->tried_servers_mask);
+        if (next_idx < 0) {
+            LOGERR("[tcp_handshake] all servers exhausted after failure (%s), closing session", reason);
+            tcp_session_close(evloop, session, true);
+            return false;
+        }
+
+        session->server_idx = (uint8_t)next_idx;
+        session->tried_servers_mask |= (uint8_t)(1u << next_idx);
+        session->retry_count++;
+
+        LOG_ALWAYS_INF("[tcp_handshake] failover (%s): [%d] -> [%d] %s:%u (attempt %u/%d)",
+                       reason, failed_idx, next_idx,
+                       g_ss_servers[next_idx].ipstr, (unsigned)g_ss_servers[next_idx].portno,
+                       session->retry_count, g_ss_server_count);
+
+        ss2022_client_ctx *ctx = tcp_ctx_get(next_idx);
+        if (!ctx || ss2022_tcp_client_init(&session->ss_client, ctx) != SS2022_OK) {
+            LOGERR("[tcp_handshake] init ss_client failed for server [%d], trying next", next_idx);
+            continue;
+        }
+
+        if (tcp_handshake_try_connect(evloop, session, &node_failure)) {
+            return true;
+        }
+    }
+}
+
+static bool tcp_handshake_start(evloop_t *evloop, tcp_session_t *session) {
+    ev_timer_stop(evloop, &session->phase_timer);
+    ev_io_stop(evloop, &session->client_watcher);
+
+    bool node_failure;
+    if (tcp_handshake_try_connect(evloop, session, &node_failure)) {
+        return true;
+    }
+    return tcp_handshake_retry(evloop, session, "initial connect failed", node_failure);
 }
 
 static bool tcp_handshake_read_initial_payload(evloop_t *evloop, tcp_session_t *session, bool *need_wait) {
@@ -870,21 +949,31 @@ static tcp_session_t *tcp_session_create(int client_sockfd, const ss2022_addr *t
     session->handshake.target = *target;
     session->client_peer_addr = *client_peer_addr;
 
-    ss_server_t *srv = server_selector_best_tcp();
-    int server_idx = (int)(srv - g_ss_servers);
-    session->server_idx = (uint8_t)server_idx;
+    int server_idx = -1;
+    while (true) {
+        int next = (server_idx < 0)
+                   ? (int)(server_selector_best_tcp() - g_ss_servers)
+                   : server_selector_next_best_tcp(session->tried_servers_mask);
+        if (next < 0) {
+            LOGERR("[tcp_session] no available ss2022 server candidate");
+            mempool_free_sized(g_tcp_session_pool, session, sizeof(*session));
+            return NULL;
+        }
+        server_idx = next;
+        session->server_idx = (uint8_t)server_idx;
+        session->tried_servers_mask |= (uint8_t)(1u << server_idx);
 
-    ss2022_client_ctx *ctx = tcp_ctx_get(server_idx);
-    if (!ctx) {
-        LOGERR("[tcp_session] ss2022 ctx init failed");
-        mempool_free_sized(g_tcp_session_pool, session, sizeof(*session));
-        return NULL;
-    }
-    int ret = ss2022_tcp_client_init(&session->ss_client, ctx);
-    if (ret != SS2022_OK) {
-        LOGERR("[tcp_session] ss2022 tcp init failed: %d", ret);
-        mempool_free_sized(g_tcp_session_pool, session, sizeof(*session));
-        return NULL;
+        ss2022_client_ctx *ctx = tcp_ctx_get(server_idx);
+        if (!ctx) {
+            LOGERR("[tcp_session] ss2022 ctx init failed for server [%d]", server_idx);
+            continue;
+        }
+        int ret = ss2022_tcp_client_init(&session->ss_client, ctx);
+        if (ret != SS2022_OK) {
+            LOGERR("[tcp_session] ss2022 tcp init failed for server [%d]: %d", server_idx, ret);
+            continue;
+        }
+        break;
     }
 
     session->client_watcher.data = session;

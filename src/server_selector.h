@@ -47,8 +47,16 @@ extern int         g_ss_server_count;
 extern _Atomic int g_ss_best_tcp_idx;
 extern _Atomic int g_ss_best_udp_idx;
 
+/* Initialize before worker threads can accept connections. */
+void server_selector_init(void);
 void server_selector_start(evloop_t *evloop);
 void server_selector_stop(evloop_t *evloop);
+int  server_selector_next_best_tcp(uint32_t tried_mask);
+/* Snapshot of the healthy UDP best replacing a failed node, or -1. */
+int  server_selector_udp_replacement(int server_idx);
+void server_selector_report_tcp_failure(int server_idx);
+uint64_t server_selector_tcp_attempt(int server_idx);
+void server_selector_report_tcp_success(int server_idx, uint64_t attempt_epoch);
 
 static inline ss_server_t *server_selector_best_tcp(void) {
     int idx = atomic_load_explicit(&g_ss_best_tcp_idx, memory_order_acquire);

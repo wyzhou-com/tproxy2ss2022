@@ -263,56 +263,56 @@ static unsigned long parse_command_args(int argc, char* argv[]) {
                 }
                 break;
             case 'S': {
-                    unsigned long val;
-                    if (!validate_uint_range(optarg, 255, &val, "number of syn retransmits")) {
-                        goto PRINT_HELP_AND_EXIT;
-                    }
-                    g_tcp_syncnt_max = (uint8_t)val;
-                    break;
+                unsigned long val;
+                if (!validate_uint_range(optarg, 255, &val, "number of syn retransmits")) {
+                    goto PRINT_HELP_AND_EXIT;
                 }
+                g_tcp_syncnt_max = (uint8_t)val;
+                break;
+            }
             case 'c': {
-                    unsigned long val;
-                    if (!validate_uint_range(optarg, 65535, &val, "maxsize of udp lrucache")) {
-                        goto PRINT_HELP_AND_EXIT;
-                    }
-                    udp_lrucache_set_maxsize((uint16_t)val);
-                    break;
+                unsigned long val;
+                if (!validate_uint_range(optarg, 65535, &val, "maxsize of udp lrucache")) {
+                    goto PRINT_HELP_AND_EXIT;
                 }
+                udp_lrucache_set_maxsize((uint16_t)val);
+                break;
+            }
             case 'o': {
-                    unsigned long val;
-                    if (!validate_uint_range(optarg, 65535, &val, "udp socket idle timeout")) {
-                        goto PRINT_HELP_AND_EXIT;
-                    }
-                    if (val < UDP_IDLE_TIMEOUT_DEFAULT_SEC) {
-                        val = UDP_IDLE_TIMEOUT_DEFAULT_SEC;
-                    }
-                    g_udp_idletimeout_sec = (uint16_t)val;
-                    break;
+                unsigned long val;
+                if (!validate_uint_range(optarg, 65535, &val, "udp socket idle timeout")) {
+                    goto PRINT_HELP_AND_EXIT;
                 }
+                if (val < UDP_IDLE_TIMEOUT_DEFAULT_SEC) {
+                    val = UDP_IDLE_TIMEOUT_DEFAULT_SEC;
+                }
+                g_udp_idletimeout_sec = (uint16_t)val;
+                break;
+            }
             case 'j': {
-                    unsigned long val;
-                    if (!validate_uint_range(optarg, MAX_THREADS + 1, &val, "number of worker threads")) {
-                        goto PRINT_HELP_AND_EXIT;
-                    }
-                    g_nthreads = (uint8_t)val;
-                    break;
+                unsigned long val;
+                if (!validate_uint_range(optarg, MAX_THREADS + 1, &val, "number of worker threads")) {
+                    goto PRINT_HELP_AND_EXIT;
                 }
+                g_nthreads = (uint8_t)val;
+                break;
+            }
             case 'J': {
-                    unsigned long val;
-                    if (!validate_uint_range(optarg, MAX_THREADS + 1, &val, "number of udp threads")) {
-                        goto PRINT_HELP_AND_EXIT;
-                    }
-                    g_udp_nthreads = (uint8_t)val;
-                    break;
+                unsigned long val;
+                if (!validate_uint_range(optarg, MAX_THREADS + 1, &val, "number of udp threads")) {
+                    goto PRINT_HELP_AND_EXIT;
                 }
+                g_udp_nthreads = (uint8_t)val;
+                break;
+            }
             case 'n': {
-                    unsigned long val;
-                    if (!validate_uint_range(optarg, ULONG_MAX, &val, "nofile limit")) {
-                        goto PRINT_HELP_AND_EXIT;
-                    }
-                    nofile_limit = val;
-                    break;
+                unsigned long val;
+                if (!validate_uint_range(optarg, ULONG_MAX, &val, "nofile limit")) {
+                    goto PRINT_HELP_AND_EXIT;
                 }
+                nofile_limit = val;
+                break;
+            }
             case 'T':
                 g_options &= (uint16_t)~OPT_ENABLE_UDP;
                 break;
@@ -417,6 +417,7 @@ int main(int argc, char* argv[]) {
     setvbuf(stdout, NULL, _IOLBF, 256);
 
     unsigned long nofile_limit = parse_command_args(argc, argv);
+    server_selector_init();
 
     if (nofile_limit) {
         set_nofile_limit(nofile_limit);

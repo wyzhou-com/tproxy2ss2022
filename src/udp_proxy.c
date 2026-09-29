@@ -626,9 +626,9 @@ static void udp_relay_on_server_reply(evloop_t *evloop, struct ev_watcher *watch
     }
 }
 
-static udp_session_t *udp_session_create(evloop_t *evloop, const udp_ingress_t *pkt, const udp_symmetric_key_t *symmetric_key) {
-    ss_server_t *srv = server_selector_best_udp();
-    int server_idx = (int)(srv - g_ss_servers);
+static udp_session_t *udp_session_create(evloop_t *evloop, const udp_ingress_t *pkt,
+        const udp_symmetric_key_t *symmetric_key, int server_idx) {
+    ss_server_t *srv = &g_ss_servers[server_idx];
 
     int udp_sockfd = udp_relay_connect_server(srv);
     if (udp_sockfd < 0) {
@@ -717,6 +717,32 @@ static void udp_relay_send_to_server(udp_session_t *session,
     }
 }
 
+static udp_session_t *udp_session_get_or_create(evloop_t *evloop, const udp_ingress_t *pkt,
+        const udp_symmetric_key_t *symmetric_key) {
+    udp_session_t *session = udp_session_lookup(pkt, symmetric_key);
+    int server_idx = -1;
+    if (session) {
+        server_idx = server_selector_udp_replacement(session->server_idx);
+        if (server_idx >= 0) {
+            LOGINF("[udp_session] replacing failed server [%u] with healthy best [%d]",
+                   (unsigned)session->server_idx, server_idx);
+            /* Runs on the session's owning loop. Stop its watcher and remove
+             * the cache entry before creating another; never replay old data. */
+            udp_session_close_indexed(evloop, session);
+            session = NULL;
+        }
+    }
+    if (session) {
+        udp_session_touch(session, ev_now(evloop));
+        return session;
+    }
+    if (server_idx < 0)
+        server_idx = (int)(server_selector_best_udp() - g_ss_servers);
+    /* Use the checked snapshot, rather than rereading a concurrently changing
+     * global best after deleting the old session. */
+    return udp_session_create(evloop, pkt, symmetric_key, server_idx);
+}
+
 static void udp_proxy_handle_ingress(evloop_t *evloop, evio_t *tprecv_watcher, struct msghdr *msg, size_t nrecv, uint8_t *buffer) {
     bool is_ipv4 = (intptr_t)tprecv_watcher->data;
     udp_ingress_t pkt;
@@ -735,15 +761,8 @@ static void udp_proxy_handle_ingress(evloop_t *evloop, evio_t *tprecv_watcher, s
         symmetric_key_ptr = &symmetric_key;
     }
 
-    udp_session_t *session = udp_session_lookup(&pkt, symmetric_key_ptr);
-    if (!session) {
-        session = udp_session_create(evloop, &pkt, symmetric_key_ptr);
-        if (!session) {
-            return;
-        }
-    } else {
-        udp_session_touch(session, ev_now(evloop));
-    }
+    udp_session_t *session = udp_session_get_or_create(evloop, &pkt, symmetric_key_ptr);
+    if (!session) return;
 
     udp_relay_send_to_server(session, &pkt.ss_target, &pkt.original_target_endpoint, buffer, nrecv);
 }

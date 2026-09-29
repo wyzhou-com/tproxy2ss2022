@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -18,23 +19,47 @@ int         g_ss_server_count = 0;
 _Atomic int g_ss_best_tcp_idx = 0;
 _Atomic int g_ss_best_udp_idx = 0;
 
-static int       g_probes_remaining = 0;
-static evtimer_t g_check_timer;
+typedef enum {
+    SS_HEALTH_UNKNOWN,
+    SS_HEALTH_OK,
+    SS_HEALTH_FAILED,
+} ss_health_t;
 
-static ss2022_client_ctx g_ss_ctx[SS_MAX_SERVERS];
-static bool              g_ss_ctx_ready[SS_MAX_SERVERS];
+typedef struct {
+    pthread_mutex_t lock;
+    const char *name;
+    bool is_tcp;
+    _Atomic int *best_idx;
+    ss_health_t health[SS_MAX_SERVERS];
+    uint64_t failure_epoch[SS_MAX_SERVERS];
+    /* Timer, outstanding probes and crypto contexts belong to this protocol.
+     * Only the main event loop accesses these fields. */
+    int probes_remaining;
+    evtimer_t check_timer;
+    ss2022_client_ctx ctx[SS_MAX_SERVERS];
+    bool ctx_ready[SS_MAX_SERVERS];
+} ss_selector_t;
 
-static ss2022_client_ctx *ss_ctx_get(int idx) {
-    if (!g_ss_ctx_ready[idx]) {
-        if (ss2022_client_ctx_init(&g_ss_ctx[idx],
+static ss_selector_t g_tcp_selector = {
+    .lock = PTHREAD_MUTEX_INITIALIZER, .name = "TCP", .is_tcp = true,
+    .best_idx = &g_ss_best_tcp_idx,
+};
+static ss_selector_t g_udp_selector = {
+    .lock = PTHREAD_MUTEX_INITIALIZER, .name = "UDP", .is_tcp = false,
+    .best_idx = &g_ss_best_udp_idx,
+};
+
+static ss2022_client_ctx *ss_ctx_get(ss_selector_t *selector, int idx) {
+    if (!selector->ctx_ready[idx]) {
+        if (ss2022_client_ctx_init(&selector->ctx[idx],
                                    g_ss_servers[idx].method,
                                    g_ss_servers[idx].psk) != SS2022_OK) {
-            LOGERR("[server_selector] ss2022 ctx init failed for server [%d]", idx);
+            LOGERR("[server_selector] %s ctx init failed for server [%d]", selector->name, idx);
             return NULL;
         }
-        g_ss_ctx_ready[idx] = true;
+        selector->ctx_ready[idx] = true;
     }
-    return &g_ss_ctx[idx];
+    return &selector->ctx[idx];
 }
 
 static int cmp_u32(const void *a, const void *b) {
@@ -87,74 +112,170 @@ static uint32_t ss_compute_score(ss_sample_t *window, int count, int head, ev_ts
     return (uint32_t)((nrtt + fail_rate * 3.0 + nmad) / 5.0 * 10000.0);
 }
 
-static void ss_push_tcp_sample(ss_server_t *srv, uint32_t latency_ms, bool errored, ev_tstamp now) {
-    int slot = srv->tcp_window_head;
-    srv->tcp_window[slot] = (ss_sample_t) {
-        latency_ms, errored, now
-    };
-    srv->tcp_window_head = (slot + 1) % SS_WINDOW_SLOTS;
-    if (srv->tcp_window_count < SS_WINDOW_SLOTS)
-        srv->tcp_window_count++;
-    uint32_t score = ss_compute_score(srv->tcp_window, srv->tcp_window_count,
-                                      srv->tcp_window_head, now);
-    atomic_store_explicit(&srv->tcp_score, score, memory_order_release);
-}
-
-static void ss_push_udp_sample(ss_server_t *srv, uint32_t latency_ms, bool errored, ev_tstamp now) {
-    int slot = srv->udp_window_head;
-    srv->udp_window[slot] = (ss_sample_t) {
-        latency_ms, errored, now
-    };
-    srv->udp_window_head = (slot + 1) % SS_WINDOW_SLOTS;
-    if (srv->udp_window_count < SS_WINDOW_SLOTS)
-        srv->udp_window_count++;
-    uint32_t score = ss_compute_score(srv->udp_window, srv->udp_window_count,
-                                      srv->udp_window_head, now);
-    atomic_store_explicit(&srv->udp_score, score, memory_order_release);
-}
-
 #define SS_SWITCH_THRESHOLD 6u
 
-static void ss_update_best(void) {
-    int best_tcp = atomic_load_explicit(&g_ss_best_tcp_idx, memory_order_relaxed);
-    int best_udp = atomic_load_explicit(&g_ss_best_udp_idx, memory_order_relaxed);
-    uint32_t best_tcp_score = atomic_load_explicit(&g_ss_servers[best_tcp].tcp_score, memory_order_acquire);
-    uint32_t best_udp_score = atomic_load_explicit(&g_ss_servers[best_udp].udp_score, memory_order_acquire);
-
-    for (int i = 0; i < g_ss_server_count; i++) {
-        uint32_t ts = atomic_load_explicit(&g_ss_servers[i].tcp_score, memory_order_acquire);
-        uint32_t us = atomic_load_explicit(&g_ss_servers[i].udp_score, memory_order_acquire);
-        if (ts < best_tcp_score && best_tcp_score - ts > SS_SWITCH_THRESHOLD) {
-            best_tcp_score = ts;
-            best_tcp = i;
-        }
-        if (us < best_udp_score && best_udp_score - us > SS_SWITCH_THRESHOLD) {
-            best_udp_score = us;
-            best_udp = i;
-        }
-    }
-
-    int prev_tcp = atomic_exchange_explicit(&g_ss_best_tcp_idx, best_tcp, memory_order_acq_rel);
-    int prev_udp = atomic_exchange_explicit(&g_ss_best_udp_idx, best_udp, memory_order_acq_rel);
-
-    if (prev_tcp != best_tcp)
-        LOG_ALWAYS_INF("[server_selector] TCP best changed: [%d] %s:%u -> [%d] %s:%u (score %u)",
-                       prev_tcp, g_ss_servers[prev_tcp].ipstr, (unsigned)g_ss_servers[prev_tcp].portno,
-                       best_tcp,  g_ss_servers[best_tcp].ipstr,  (unsigned)g_ss_servers[best_tcp].portno,
-                       best_tcp_score);
-
-    if (prev_udp != best_udp)
-        LOG_ALWAYS_INF("[server_selector] UDP best changed: [%d] %s:%u -> [%d] %s:%u (score %u)",
-                       prev_udp, g_ss_servers[prev_udp].ipstr, (unsigned)g_ss_servers[prev_udp].portno,
-                       best_udp,  g_ss_servers[best_udp].ipstr,  (unsigned)g_ss_servers[best_udp].portno,
-                       best_udp_score);
+static const char *ss_health_name(ss_health_t health) {
+    return health == SS_HEALTH_OK ? "healthy" :
+           health == SS_HEALTH_FAILED ? "failed" : "unknown";
 }
 
-static void probe_maybe_update_best(void) {
-    if (--g_probes_remaining <= 0) {
-        g_probes_remaining = 0;
-        ss_update_best();
+static int ss_health_rank(ss_health_t health) {
+    return health == SS_HEALTH_OK ? 0 : health == SS_HEALTH_UNKNOWN ? 1 : 2;
+}
+
+static _Atomic uint32_t *ss_score_ptr(ss_selector_t *selector, int idx) {
+    return selector->is_tcp ? &g_ss_servers[idx].tcp_score : &g_ss_servers[idx].udp_score;
+}
+
+/* All ranking and publication use the same per-protocol lock. Readers of the
+ * selected index remain lock-free. Unknown nodes rank ahead of failed nodes. */
+static bool ss_better_locked(ss_selector_t *selector, int a, int b) {
+    int ar = ss_health_rank(selector->health[a]);
+    int br = ss_health_rank(selector->health[b]);
+    return ar < br || (ar == br &&
+                       atomic_load_explicit(ss_score_ptr(selector, a), memory_order_relaxed) <
+                       atomic_load_explicit(ss_score_ptr(selector, b), memory_order_relaxed));
+}
+
+static int ss_candidate_locked(ss_selector_t *selector, uint32_t tried_mask) {
+    int best = atomic_load_explicit(selector->best_idx, memory_order_relaxed);
+    if (best < 0 || best >= g_ss_server_count || (tried_mask & (1u << best)))
+        best = -1;
+    for (int i = 0; i < g_ss_server_count; i++) {
+        if (tried_mask & (1u << i)) continue;
+        if (best < 0 || ss_better_locked(selector, i, best)) best = i;
     }
+    return best;
+}
+
+static void ss_update_best_locked(ss_selector_t *selector, const char *reason, int failed_idx,
+                                  bool allow_score_switch) {
+    int prev = atomic_load_explicit(selector->best_idx, memory_order_relaxed);
+    int best = ss_candidate_locked(selector, 0);
+    if (best < 0) return;
+    /* With every node failed, keep trying alternatives instead of pinning all
+     * new connections to the formerly fastest dead node. */
+    bool force = failed_idx == prev && g_ss_server_count > 1;
+    if (force && best == prev)
+        best = ss_candidate_locked(selector, 1u << prev);
+    if (best == prev) return;
+    /* During a round, scores contain a mix of old and new samples. Only
+     * health improvements and failure failover may switch immediately.
+     * Business feedback uses this gate too, without reading loop-owned
+     * probes_remaining from a worker thread. */
+    if (!force && !allow_score_switch && selector->health[best] == selector->health[prev])
+        return;
+    uint32_t score = atomic_load_explicit(ss_score_ptr(selector, best), memory_order_relaxed);
+    uint32_t prev_score = atomic_load_explicit(ss_score_ptr(selector, prev), memory_order_relaxed);
+    if (!force && selector->health[best] == selector->health[prev] &&
+            (score >= prev_score || prev_score - score <= SS_SWITCH_THRESHOLD))
+        return;
+    atomic_store_explicit(selector->best_idx, best, memory_order_release);
+    LOG_ALWAYS_INF("[server_selector] %s best changed (%s): [%d] %s:%u -> [%d] %s:%u "
+                   "(score=%u health=%s)", selector->name, reason,
+                   prev, g_ss_servers[prev].ipstr, (unsigned)g_ss_servers[prev].portno,
+                   best, g_ss_servers[best].ipstr, (unsigned)g_ss_servers[best].portno,
+                   score, ss_health_name(selector->health[best]));
+}
+
+static uint64_t ss_attempt_epoch(ss_selector_t *selector, int idx) {
+    pthread_mutex_lock(&selector->lock);
+    uint64_t epoch = selector->failure_epoch[idx];
+    pthread_mutex_unlock(&selector->lock);
+    return epoch;
+}
+
+uint64_t server_selector_tcp_attempt(int server_idx) {
+    return ss_attempt_epoch(&g_tcp_selector, server_idx);
+}
+
+int server_selector_next_best_tcp(uint32_t tried_mask) {
+    pthread_mutex_lock(&g_tcp_selector.lock);
+    int best = ss_candidate_locked(&g_tcp_selector, tried_mask);
+    pthread_mutex_unlock(&g_tcp_selector.lock);
+    return best;
+}
+
+int server_selector_udp_replacement(int server_idx) {
+    ss_selector_t *selector = &g_udp_selector;
+    pthread_mutex_lock(&selector->lock);
+    int best = atomic_load_explicit(selector->best_idx, memory_order_relaxed);
+    int replacement = -1;
+    if (server_idx >= 0 && server_idx < g_ss_server_count &&
+            best >= 0 && best < g_ss_server_count && best != server_idx &&
+            selector->health[server_idx] == SS_HEALTH_FAILED &&
+            selector->health[best] == SS_HEALTH_OK)
+        replacement = best;
+    pthread_mutex_unlock(&selector->lock);
+    return replacement;
+}
+
+void server_selector_report_tcp_failure(int server_idx) {
+    if (server_idx < 0 || server_idx >= g_ss_server_count) return;
+    ss_selector_t *selector = &g_tcp_selector;
+    pthread_mutex_lock(&selector->lock);
+    selector->failure_epoch[server_idx]++;
+    selector->health[server_idx] = SS_HEALTH_FAILED;
+    LOGINF("[server_selector] TCP [%d] business handshake failed: score=%u health=failed",
+           server_idx, atomic_load_explicit(&g_ss_servers[server_idx].tcp_score, memory_order_relaxed));
+    ss_update_best_locked(selector, "business handshake failure", server_idx, false);
+    pthread_mutex_unlock(&selector->lock);
+}
+
+void server_selector_report_tcp_success(int server_idx, uint64_t attempt_epoch) {
+    if (server_idx < 0 || server_idx >= g_ss_server_count) return;
+    ss_selector_t *selector = &g_tcp_selector;
+    pthread_mutex_lock(&selector->lock);
+    /* A response from an older connection must not erase a newer failure. */
+    if (attempt_epoch == selector->failure_epoch[server_idx]) {
+        selector->health[server_idx] = SS_HEALTH_OK;
+        ss_update_best_locked(selector, "authenticated business response", -1, false);
+    }
+    pthread_mutex_unlock(&selector->lock);
+}
+
+static void ss_record_probe(ss_selector_t *selector, int idx, uint32_t latency_ms,
+                            bool errored, uint64_t attempt_epoch, ev_tstamp now,
+                            const char *stage) {
+    ss_server_t *srv = &g_ss_servers[idx];
+    ss_sample_t *window = selector->is_tcp ? srv->tcp_window : srv->udp_window;
+    int *head = selector->is_tcp ? &srv->tcp_window_head : &srv->udp_window_head;
+    int *count = selector->is_tcp ? &srv->tcp_window_count : &srv->udp_window_count;
+    window[*head] = (ss_sample_t) {
+        latency_ms, errored, now
+    };
+    *head = (*head + 1) % SS_WINDOW_SLOTS;
+    if (*count < SS_WINDOW_SLOTS) (*count)++;
+    uint32_t score = ss_compute_score(window, *count, *head, now);
+
+    pthread_mutex_lock(&selector->lock);
+    atomic_store_explicit(ss_score_ptr(selector, idx), score, memory_order_release);
+    if (errored) {
+        selector->failure_epoch[idx]++;
+        selector->health[idx] = SS_HEALTH_FAILED;
+    } else if (attempt_epoch == selector->failure_epoch[idx]) {
+        selector->health[idx] = SS_HEALTH_OK;
+    }
+    LOGINF("[server_selector] %s [%d] %s:%u: %s %ums score=%u health=%s stage=%s",
+           selector->name, idx, srv->ipstr, (unsigned)srv->portno,
+           errored ? "error" : "ok", latency_ms, score,
+           ss_health_name(selector->health[idx]), stage);
+    ss_update_best_locked(selector, errored ? "probe failure" : "probe success", errored ? idx : -1, false);
+    pthread_mutex_unlock(&selector->lock);
+}
+
+static void ss_probe_done(ss_selector_t *selector) {
+    if (--selector->probes_remaining == 0) {
+        pthread_mutex_lock(&selector->lock);
+        ss_update_best_locked(selector, "probe round complete", -1, true);
+        pthread_mutex_unlock(&selector->lock);
+    }
+}
+
+static void ss_probe_skip(ss_selector_t *selector, int idx, const char *reason) {
+    LOGERR("[server_selector] %s [%d] probe skipped: local %s; health unchanged",
+           selector->name, idx, reason);
+    ss_probe_done(selector);
 }
 
 #define TCP_PROBE_SEND_BUF_SIZE 1024
@@ -167,6 +288,7 @@ static const char TCP_PROBE_REQUEST[] =
 
 typedef enum {
     TCP_PROBE_CONNECTING,
+    TCP_PROBE_SENDING,
     TCP_PROBE_RECV_RESP_HDR,
     TCP_PROBE_RECV_PAYLOAD,
     TCP_PROBE_RECV_LENGTH,
@@ -176,6 +298,7 @@ typedef struct {
     ss2022_tcp_client tcp_client;
     evloop_t *evloop;
     ev_tstamp start_ts;
+    uint64_t attempt_epoch;
 
     size_t   send_len;
     size_t   send_off;
@@ -210,17 +333,23 @@ static void tcp_probe_finish(ss_tcp_probe_t *p, uint32_t latency_ms, bool errore
     p->sockfd = -1;
     ss2022_tcp_client_free(&p->tcp_client);
 
-    ss_server_t *srv = &g_ss_servers[p->server_idx];
-    ss_push_tcp_sample(srv, latency_ms, errored, ev_now(p->evloop));
+    static const char *stages[] = {"connect", "send", "response-header", "payload", "length"};
+    ss_record_probe(&g_tcp_selector, p->server_idx, latency_ms, errored,
+                    p->attempt_epoch, ev_now(p->evloop), stages[p->state]);
+    ss_probe_done(&g_tcp_selector);
+}
 
-    LOGINF("[server_selector] tcp [%d] %s:%u: %s %ums score=%u",
-           p->server_idx, srv->ipstr, (unsigned)srv->portno,
-           errored ? "error" : "ok", latency_ms,
-           atomic_load_explicit(&srv->tcp_score, memory_order_relaxed));
-
-    if (!errored)
-        ss_update_best();
-    probe_maybe_update_best();
+static void tcp_probe_socket_error(ss_tcp_probe_t *p, int err) {
+    if (!socket_error_is_local(err)) {
+        tcp_probe_finish(p, (uint32_t)((ev_now(p->evloop) - p->start_ts) * 1000.0), true);
+        return;
+    }
+    ev_io_stop(p->evloop, &p->io_watcher);
+    ev_timer_stop(p->evloop, &p->timeout_timer);
+    close(p->sockfd);
+    p->sockfd = -1;
+    ss2022_tcp_client_free(&p->tcp_client);
+    ss_probe_skip(&g_tcp_selector, p->server_idx, strerror(err));
 }
 
 static void tcp_probe_on_recv(evloop_t *evloop, struct ev_watcher *watcher, int revents __attribute__((unused))) {
@@ -239,7 +368,7 @@ static void tcp_probe_on_recv(evloop_t *evloop, struct ev_watcher *watcher, int 
             return;
         if (errno == EAGAIN || errno == EWOULDBLOCK)
             return;
-        tcp_probe_finish(p, (uint32_t)((ev_now(p->evloop) - p->start_ts) * 1000.0), true);
+        tcp_probe_socket_error(p, errno);
         return;
     }
     if (nr == 0) {
@@ -349,8 +478,9 @@ static void tcp_probe_on_send(evloop_t *evloop, struct ev_watcher *watcher, int 
                     ev_io_start(p->evloop, &p->io_watcher);
                 return;
             }
-            LOGERR("[server_selector] tcp [%d]: send: %s", p->server_idx, strerror(errno));
-            tcp_probe_finish(p, (uint32_t)((ev_now(p->evloop) - p->start_ts) * 1000.0), true);
+            int saved_errno = errno;
+            LOGERR("[server_selector] tcp [%d]: send: %s", p->server_idx, strerror(saved_errno));
+            tcp_probe_socket_error(p, saved_errno);
             return;
         }
         if (ns == 0) {
@@ -381,28 +511,11 @@ static void tcp_probe_on_connected(evloop_t *evloop, struct ev_watcher *watcher,
     ss_tcp_probe_t *p = watcher->data;
 
     if (tcp_has_error(p->sockfd)) {
-        tcp_probe_finish(p, (uint32_t)((ev_now(p->evloop) - p->start_ts) * 1000.0), true);
+        tcp_probe_socket_error(p, errno);
         return;
     }
 
-    ss2022_addr target = {
-        .type = SS2022_ADDR_DOMAIN,
-        .port = 80,
-        .u.domain.len = 10,
-    };
-    memcpy(target.u.domain.name, "google.com", 10);
-
-    int ret = ss2022_tcp_client_build_request_header(
-                  &p->tcp_client, &target,
-                  (const uint8_t *)TCP_PROBE_REQUEST, sizeof(TCP_PROBE_REQUEST) - 1,
-                  p->send_buf, sizeof(p->send_buf), &p->send_len);
-    if (ret != SS2022_OK) {
-        LOGERR("[server_selector] tcp [%d]: build_request_header failed: %d", p->server_idx, ret);
-        tcp_probe_finish(p, (uint32_t)((ev_now(p->evloop) - p->start_ts) * 1000.0), true);
-        return;
-    }
-    p->send_off = 0;
-
+    p->state = TCP_PROBE_SENDING;
     ev_set_cb(&p->io_watcher, tcp_probe_on_send);
     ev_invoke(evloop, watcher, EV_WRITE);
 }
@@ -414,51 +527,53 @@ static void tcp_probe_on_timeout(evloop_t *evloop, struct ev_watcher *watcher, i
 }
 
 static void tcp_probe_start(evloop_t *evloop, int idx) {
-    ss_server_t    *srv = &g_ss_servers[idx];
-    ss_tcp_probe_t *p   = &g_tcp_probes[idx];
+    ss_server_t *srv = &g_ss_servers[idx];
+    ss_tcp_probe_t *p = &g_tcp_probes[idx];
+    p->attempt_epoch = ss_attempt_epoch(&g_tcp_selector, idx);
 
-    ss2022_client_ctx *ctx = ss_ctx_get(idx);
+    ss2022_client_ctx *ctx = ss_ctx_get(&g_tcp_selector, idx);
     if (!ctx || ss2022_tcp_client_init(&p->tcp_client, ctx) != SS2022_OK) {
-        ss_push_tcp_sample(srv, SS_MAX_RTT_MS, true, ev_now(evloop));
-        probe_maybe_update_best();
+        ss_probe_skip(&g_tcp_selector, idx, "crypto initialization failure");
         return;
     }
-
-    int family = (srv->skaddr.sin6_family == AF_INET6) ? AF_INET6 : AF_INET;
-    int fd = new_tcp_connect_sockfd(family, 0);
-    if (fd < 0) {
-        LOGERR("[server_selector] tcp [%d]: new_tcp_connect_sockfd: %s", idx, strerror(errno));
+    ss2022_addr target = {.type = SS2022_ADDR_DOMAIN, .port = 80, .u.domain.len = 10};
+    memcpy(target.u.domain.name, "google.com", 10);
+    if (ss2022_tcp_client_build_request_header(&p->tcp_client, &target,
+            (const uint8_t *)TCP_PROBE_REQUEST, sizeof(TCP_PROBE_REQUEST) - 1,
+            p->send_buf, sizeof(p->send_buf), &p->send_len) != SS2022_OK) {
         ss2022_tcp_client_free(&p->tcp_client);
-        ss_push_tcp_sample(srv, SS_MAX_RTT_MS, true, ev_now(evloop));
-        probe_maybe_update_best();
+        ss_probe_skip(&g_tcp_selector, idx, "request construction failure");
         return;
     }
-
-    p->evloop     = evloop;
+    p->send_off = 0;
+    int family = srv->skaddr.sin6_family == AF_INET6 ? AF_INET6 : AF_INET;
+    int fd = new_tcp_connect_sockfd(family, g_tcp_syncnt_max);
+    if (fd < 0) {
+        ss2022_tcp_client_free(&p->tcp_client);
+        ss_probe_skip(&g_tcp_selector, idx, "socket creation failure");
+        return;
+    }
+    p->evloop = evloop;
     p->server_idx = idx;
-    p->sockfd     = fd;
-    p->start_ts   = ev_now(evloop);
-    p->state      = TCP_PROBE_CONNECTING;
-    p->io_watcher.data    = p;
+    p->sockfd = fd;
+    p->start_ts = ev_now(evloop);
+    p->state = TCP_PROBE_CONNECTING;
+    p->io_watcher.data = p;
     p->timeout_timer.data = p;
-
     ev_io_init(&p->io_watcher, tcp_probe_on_connected, fd, EV_WRITE);
     ev_timer_init(&p->timeout_timer, tcp_probe_on_timeout, SS_CHECK_TIMEOUT, 0.0);
     ev_timer_start(evloop, &p->timeout_timer);
 
     ssize_t nsend = -1;
-    tcp_connect_result_t conn = tcp_connect(fd, &srv->skaddr, NULL, 0, &nsend);
-
+    bool tfo = (g_options & OPT_ENABLE_TFO_CONNECT) != 0;
+    tcp_connect_result_t conn = tcp_connect(fd, &srv->skaddr,
+                                            tfo ? p->send_buf : NULL,
+                                            tfo ? p->send_len : 0, &nsend);
     if (conn == TCP_CONNECT_FAILED) {
-        ev_timer_stop(evloop, &p->timeout_timer);
-        close(fd);
-        p->sockfd = -1;
-        ss2022_tcp_client_free(&p->tcp_client);
-        ss_push_tcp_sample(srv, SS_MAX_RTT_MS, true, ev_now(evloop));
-        probe_maybe_update_best();
+        tcp_probe_socket_error(p, errno);
         return;
     }
-
+    if (nsend > 0) p->send_off = (size_t)nsend;
     if (conn == TCP_CONNECT_CONNECTED) {
         tcp_probe_on_connected(evloop, (struct ev_watcher *)&p->io_watcher, EV_WRITE);
     } else {
@@ -472,6 +587,7 @@ typedef struct {
     evloop_t *evloop;
     int       server_idx;
     ev_tstamp start_ts;
+    uint64_t attempt_epoch;
     int       sockfd;
 
     ss2022_udp_client_session udp_session;
@@ -520,17 +636,9 @@ static void udp_probe_finish(ss_udp_probe_t *p, uint32_t latency_ms, bool errore
     p->sockfd = -1;
     ss2022_udp_client_session_free(&p->udp_session);
 
-    ss_server_t *srv = &g_ss_servers[p->server_idx];
-    ss_push_udp_sample(srv, latency_ms, errored, ev_now(p->evloop));
-
-    LOGINF("[server_selector] udp [%d] %s:%u: %s %ums score=%u",
-           p->server_idx, srv->ipstr, (unsigned)srv->portno,
-           errored ? "error" : "ok", latency_ms,
-           atomic_load_explicit(&srv->udp_score, memory_order_relaxed));
-
-    if (!errored)
-        ss_update_best();
-    probe_maybe_update_best();
+    ss_record_probe(&g_udp_selector, p->server_idx, latency_ms, errored,
+                    p->attempt_epoch, ev_now(p->evloop), "dns-response");
+    ss_probe_done(&g_udp_selector);
 }
 
 static void udp_probe_on_recv(evloop_t *evloop, struct ev_watcher *watcher, int revents __attribute__((unused))) {
@@ -581,10 +689,10 @@ static void udp_probe_start(evloop_t *evloop, int idx) {
     ss_server_t    *srv = &g_ss_servers[idx];
     ss_udp_probe_t *p   = &g_udp_probes[idx];
 
-    ss2022_client_ctx *ctx = ss_ctx_get(idx);
+    p->attempt_epoch = ss_attempt_epoch(&g_udp_selector, idx);
+    ss2022_client_ctx *ctx = ss_ctx_get(&g_udp_selector, idx);
     if (!ctx || ss2022_udp_client_session_init(&p->udp_session, ctx) != SS2022_OK) {
-        ss_push_udp_sample(srv, SS_MAX_RTT_MS, true, ev_now(evloop));
-        probe_maybe_update_best();
+        ss_probe_skip(&g_udp_selector, idx, "probe setup failure");
         return;
     }
 
@@ -593,8 +701,7 @@ static void udp_probe_start(evloop_t *evloop, int idx) {
     if (fd < 0) {
         LOGERR("[server_selector] udp [%d]: new_udp_normal_sockfd: %s", idx, strerror(errno));
         ss2022_udp_client_session_free(&p->udp_session);
-        ss_push_udp_sample(srv, SS_MAX_RTT_MS, true, ev_now(evloop));
-        probe_maybe_update_best();
+        ss_probe_skip(&g_udp_selector, idx, "probe setup failure");
         return;
     }
 
@@ -613,8 +720,7 @@ static void udp_probe_start(evloop_t *evloop, int idx) {
         LOGERR("[server_selector] udp [%d]: seal failed", idx);
         close(fd);
         ss2022_udp_client_session_free(&p->udp_session);
-        ss_push_udp_sample(srv, SS_MAX_RTT_MS, true, ev_now(evloop));
-        probe_maybe_update_best();
+        ss_probe_skip(&g_udp_selector, idx, "probe setup failure");
         return;
     }
 
@@ -623,11 +729,16 @@ static void udp_probe_start(evloop_t *evloop, int idx) {
                       : (socklen_t)sizeof(struct sockaddr_in);
     if (sendto(fd, sealed, sealed_len, 0,
                (const struct sockaddr *)&srv->skaddr, sklen) < 0) {
-        LOGERR("[server_selector] udp [%d]: sendto: %s", idx, strerror(errno));
+        int saved_errno = errno;
+        LOGERR("[server_selector] udp [%d]: sendto: %s", idx, strerror(saved_errno));
         close(fd);
         ss2022_udp_client_session_free(&p->udp_session);
-        ss_push_udp_sample(srv, SS_MAX_RTT_MS, true, ev_now(evloop));
-        probe_maybe_update_best();
+        if (socket_error_is_local(saved_errno)) {
+            ss_probe_skip(&g_udp_selector, idx, "send failure");
+        } else {
+            ss_record_probe(&g_udp_selector, idx, 0, true, p->attempt_epoch, ev_now(evloop), "dns-send");
+            ss_probe_done(&g_udp_selector);
+        }
         return;
     }
 
@@ -644,60 +755,56 @@ static void udp_probe_start(evloop_t *evloop, int idx) {
     ev_timer_start(evloop, &p->timeout_timer);
 }
 
-static void selector_start_probe_round(evloop_t *evloop) {
-    int probes_per_server = 0;
-    if (g_options & OPT_ENABLE_TCP)
-        probes_per_server++;
-    if (g_options & OPT_ENABLE_UDP)
-        probes_per_server++;
-
-    g_probes_remaining = g_ss_server_count * probes_per_server;
+static void selector_start_probe_round(evloop_t *evloop, ss_selector_t *selector) {
+    if (selector->probes_remaining > 0) return;
+    selector->probes_remaining = g_ss_server_count;
     for (int i = 0; i < g_ss_server_count; i++) {
-        if (g_options & OPT_ENABLE_TCP)
-            tcp_probe_start(evloop, i);
-        if (g_options & OPT_ENABLE_UDP)
-            udp_probe_start(evloop, i);
+        if (selector->is_tcp) tcp_probe_start(evloop, i);
+        else udp_probe_start(evloop, i);
     }
 }
 
-static void check_timer_cb(evloop_t *evloop, struct ev_watcher *watcher, int revents __attribute__((unused))) {
-    (void)watcher;
-    if (g_probes_remaining > 0)
-        return;
+static void check_timer_cb(evloop_t *evloop, struct ev_watcher *watcher,
+                           int revents __attribute__((unused))) {
+    selector_start_probe_round(evloop, watcher->data);
+}
 
-    selector_start_probe_round(evloop);
+void server_selector_init(void) {
+    /* Called before worker creation, never while business reports can arrive. */
+    ss_selector_t *selectors[] = {&g_tcp_selector, &g_udp_selector};
+    for (size_t n = 0; n < sizeof(selectors) / sizeof(selectors[0]); n++) {
+        ss_selector_t *selector = selectors[n];
+        selector->probes_remaining = 0;
+        memset(selector->health, 0, sizeof(selector->health));
+        memset(selector->failure_epoch, 0, sizeof(selector->failure_epoch));
+        for (int i = 0; i < g_ss_server_count; i++)
+            atomic_store_explicit(ss_score_ptr(selector, i), UINT32_MAX, memory_order_relaxed);
+        atomic_store_explicit(selector->best_idx, 0, memory_order_release);
+    }
+    for (int i = 0; i < g_ss_server_count; i++) {
+        g_ss_servers[i].tcp_window_head = g_ss_servers[i].tcp_window_count = 0;
+        g_ss_servers[i].udp_window_head = g_ss_servers[i].udp_window_count = 0;
+        g_tcp_probes[i].sockfd = g_udp_probes[i].sockfd = -1;
+    }
+}
+
+static void selector_start(evloop_t *evloop, ss_selector_t *selector) {
+    selector->check_timer.data = selector;
+    ev_timer_init(&selector->check_timer, check_timer_cb, SS_CHECK_INTERVAL, SS_CHECK_INTERVAL);
+    ev_timer_start(evloop, &selector->check_timer);
+    selector_start_probe_round(evloop, selector);
+    LOG_ALWAYS_INF("[server_selector] %s started, %d server(s), interval=%.0fs timeout=%.0fs",
+                   selector->name, g_ss_server_count, SS_CHECK_INTERVAL, SS_CHECK_TIMEOUT);
 }
 
 void server_selector_start(evloop_t *evloop) {
-    memset(g_ss_ctx_ready, 0, sizeof(g_ss_ctx_ready));
-
-    for (int i = 0; i < g_ss_server_count; i++) {
-        atomic_store_explicit(&g_ss_servers[i].tcp_score, UINT32_MAX, memory_order_relaxed);
-        atomic_store_explicit(&g_ss_servers[i].udp_score, UINT32_MAX, memory_order_relaxed);
-        g_ss_servers[i].tcp_window_head  = 0;
-        g_ss_servers[i].tcp_window_count = 0;
-        g_ss_servers[i].udp_window_head  = 0;
-        g_ss_servers[i].udp_window_count = 0;
-        g_tcp_probes[i].sockfd = -1;
-        g_udp_probes[i].sockfd = -1;
-    }
-
-    atomic_store_explicit(&g_ss_best_tcp_idx, 0, memory_order_release);
-    atomic_store_explicit(&g_ss_best_udp_idx, 0, memory_order_release);
-
-    selector_start_probe_round(evloop);
-
-    g_check_timer.data = NULL;
-    ev_timer_init(&g_check_timer, check_timer_cb, SS_CHECK_INTERVAL, SS_CHECK_INTERVAL);
-    ev_timer_start(evloop, &g_check_timer);
-
-    LOG_ALWAYS_INF("[server_selector] started, %d server(s), interval=%.0fs timeout=%.0fs",
-                   g_ss_server_count, SS_CHECK_INTERVAL, SS_CHECK_TIMEOUT);
+    if (g_options & OPT_ENABLE_TCP) selector_start(evloop, &g_tcp_selector);
+    if (g_options & OPT_ENABLE_UDP) selector_start(evloop, &g_udp_selector);
 }
 
 void server_selector_stop(evloop_t *evloop) {
-    ev_timer_stop(evloop, &g_check_timer);
-
+    ev_timer_stop(evloop, &g_tcp_selector.check_timer);
+    ev_timer_stop(evloop, &g_udp_selector.check_timer);
     for (int i = 0; i < g_ss_server_count; i++) {
         ss_tcp_probe_t *tp = &g_tcp_probes[i];
         if (tp->sockfd >= 0) {
@@ -715,12 +822,14 @@ void server_selector_stop(evloop_t *evloop) {
             up->sockfd = -1;
             ss2022_udp_client_session_free(&up->udp_session);
         }
-    }
-    for (int i = 0; i < g_ss_server_count; i++) {
-        if (g_ss_ctx_ready[i]) {
-            ss2022_client_ctx_free(&g_ss_ctx[i]);
-            g_ss_ctx_ready[i] = false;
+        ss_selector_t *selectors[] = {&g_tcp_selector, &g_udp_selector};
+        for (size_t n = 0; n < sizeof(selectors) / sizeof(selectors[0]); n++) {
+            if (selectors[n]->ctx_ready[i]) {
+                ss2022_client_ctx_free(&selectors[n]->ctx[i]);
+                selectors[n]->ctx_ready[i] = false;
+            }
         }
     }
+    g_tcp_selector.probes_remaining = g_udp_selector.probes_remaining = 0;
     LOG_ALWAYS_INF("[server_selector] stopped");
 }

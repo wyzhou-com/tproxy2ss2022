@@ -432,6 +432,12 @@ tcp_connect_result_t tcp_connect(int sockfd, const void *addr, const void *tfo_d
 }
 
 /* on connect error, errno is set appropriately */
+bool socket_error_is_local(int err) {
+    return err == ENOMEM || err == ENOBUFS || err == EMFILE || err == ENFILE ||
+           err == EACCES || err == EPERM || err == EAFNOSUPPORT ||
+           err == EPROTONOSUPPORT || err == EADDRNOTAVAIL || err == EINVAL;
+}
+
 bool tcp_has_error(int sockfd) {
     return getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &errno, &(socklen_t) {
         sizeof(errno)
